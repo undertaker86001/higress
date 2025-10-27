@@ -222,6 +222,12 @@ type ProviderConfig struct {
 	// @Title zh-CN Azure OpenAI Service URL
 	// @Description zh-CN 仅适用于Azure OpenAI服务。要请求的OpenAI服务的完整URL，包含api-version等参数
 	azureServiceUrl string `required:"false" yaml:"azureServiceUrl" json:"azureServiceUrl"`
+	// @Title zh-CN Azure Deployment映射表
+	// @Description zh-CN 仅适用于Azure OpenAI服务。用于将请求中的模型名称映射为Azure deployment名称。支持通过"*"来配置全局映射
+	deploymentMapping map[string]string `required:"false" yaml:"deploymentMapping" json:"deploymentMapping"`
+	// @Title zh-CN Azure默认Deployment名称
+	// @Description zh-CN 仅适用于Azure OpenAI服务。当没有配置deploymentMapping或映射失败时使用的默认deployment名称
+	defaultDeployment string `required:"false" yaml:"defaultDeployment" json:"defaultDeployment"`
 	// @Title zh-CN 通义千问File ID
 	// @Description zh-CN 仅适用于通义千问服务。上传到Dashscope的文件ID，其内容用于补充AI请求上下文。仅支持qwen-long模型。
 	qwenFileIds []string `required:"false" yaml:"qwenFileIds" json:"qwenFileIds"`
@@ -331,6 +337,11 @@ func (c *ProviderConfig) FromJson(json gjson.Result) {
 	c.openaiCustomUrl = json.Get("openaiCustomUrl").String()
 	c.moonshotFileId = json.Get("moonshotFileId").String()
 	c.azureServiceUrl = json.Get("azureServiceUrl").String()
+	c.deploymentMapping = make(map[string]string)
+	for k, v := range json.Get("deploymentMapping").Map() {
+		c.deploymentMapping[k] = v.String()
+	}
+	c.defaultDeployment = json.Get("defaultDeployment").String()
 	c.qwenFileIds = make([]string, 0)
 	for _, fileId := range json.Get("qwenFileIds").Array() {
 		c.qwenFileIds = append(c.qwenFileIds, fileId.String())
@@ -583,6 +594,39 @@ func getMappedModel(model string, modelMapping map[string]string) string {
 		return mappedModel
 	}
 	return model
+}
+
+// getMappedDeployment 根据模型名称获取映射的deployment名称
+func getMappedDeployment(model string, deploymentMapping map[string]string, defaultDeployment string) string {
+	if len(deploymentMapping) == 0 {
+		return defaultDeployment
+	}
+
+	// 精确匹配
+	if v, ok := deploymentMapping[model]; ok {
+		log.Debugf("model [%s] is mapped to deployment [%s] explicitly", model, v)
+		return v
+	}
+
+	// 前缀匹配
+	for k, v := range deploymentMapping {
+		if k == wildcard || !strings.HasSuffix(k, wildcard) {
+			continue
+		}
+		k = strings.TrimSuffix(k, wildcard)
+		if strings.HasPrefix(model, k) {
+			log.Debugf("model [%s] is mapped to deployment [%s] via prefix [%s]", model, v, k)
+			return v
+		}
+	}
+
+	// 通配符匹配
+	if v, ok := deploymentMapping[wildcard]; ok {
+		log.Debugf("model [%s] is mapped to deployment [%s] via wildcard", model, v)
+		return v
+	}
+
+	return defaultDeployment
 }
 
 func doGetMappedModel(model string, modelMapping map[string]string) string {

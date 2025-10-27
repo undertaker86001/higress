@@ -1,0 +1,42 @@
+# Memory Enhancement Service - LightRAG 集成版本依赖
+
+# 基础依赖
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+redis==5.0.1
+networkx==3.2.1
+numpy==1.26.3
+python-multipart==0.0.6
+
+# LightRAG 核心依赖
+lightrag-hku==0.0.1          # LightRAG 核心库
+openai==1.12.0               # OpenAI API 客户端
+tiktoken==0.5.2              # Token 计数
+tenacity==8.2.3              # 重试机制
+
+# 向量数据库选项（按需选择）
+# Chroma（推荐用于开发和小规模部署）
+chromadb==0.4.22
+
+# Qdrant（推荐用于生产环境）
+# qdrant-client==1.7.0
+
+# Weaviate
+# weaviate-client==3.25.0
+
+# 图数据库选项（按需选择）
+# Neo4j（如果需要持久化图存储）
+# neo4j==5.16.0
+
+# 文本处理
+jieba==0.42.1                # 中文分词（可选，用于关键词提取）
+
+# 监控和日志
+prometheus-client==0.19.0    # Prometheus 指标
+
+# 开发依赖
+# pytest==7.4.3
+# pytest-asyncio==0.21.1
+# locust==2.20.0              # 性能测试
