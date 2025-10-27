@@ -1,6 +1,5 @@
 """
 Memory Engine - 记忆引擎核心实现
-基于原有 memory-networkx 的 NetworkX 图结构记忆系统
 """
 import asyncio
 import json
