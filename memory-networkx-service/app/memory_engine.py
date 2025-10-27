@@ -109,18 +109,62 @@ class MemoryEngine:
             logger.error(f"添加对话失败: {e}", exc_info=True)
             raise
     
+    async def _tag_conversations(
+        self,
+        conversations: List[Dict[str, Any]],
+        summary_flag: bool
+    ) -> Tuple[str, List[str]]:
+        """
+        标记对话 - 生成摘要和标签
+        
+        这是原始 memory-networkx 的核心方法，用于：
+        1. summary_flag=True: 生成完整摘要（转换长期记忆时）
+        2. summary_flag=False: 快速提取标签（对话提取时）
+        
+        Args:
+            conversations: 对话列表
+            summary_flag: 是否生成完整摘要
+            
+        Returns:
+            (摘要, 标签列表)
+        """
+        try:
+            if summary_flag:
+                # 完整模式：生成摘要和标签
+                conversation_text = "\n".join([
+                    f"{msg['role']}: {msg['content']}"
+                    for msg in conversations[-10:]  # 取最近10条
+                ])
+                summary = await self.text_processor.generate_summary(conversation_text)
+                tags = await self.text_processor.extract_tags(conversation_text)
+            else:
+                # 快速模式：仅提取标签
+                conversation_text = "\n".join([
+                    msg['content']
+                    for msg in conversations[-5:]  # 取最近5条
+                ])
+                summary = conversation_text[:100]  # 简单摘要
+                tags = await self.text_processor.extract_tags(conversation_text)
+            
+            logger.debug(f"标记对话完成: summary_len={len(summary)}, tags_count={len(tags)}")
+            return summary, tags
+            
+        except Exception as e:
+            logger.error(f"标记对话失败: {e}", exc_info=True)
+            return "", []
+    
     async def _convert_to_long_term_memory(self) -> None:
         """将短期记忆转换为长期记忆"""
         try:
-            # 合并对话内容
-            conversation_text = "\n".join([
-                f"{msg['role']}: {msg['content']}"
-                for msg in self.short_term_memory[-10:]  # 取最近10条
-            ])
+            # 使用 _tag_conversations 生成摘要和标签
+            summary, tags = await self._tag_conversations(
+                self.short_term_memory,
+                summary_flag=True
+            )
             
-            # 生成摘要和标签
-            summary = await self.text_processor.generate_summary(conversation_text)
-            tags = await self.text_processor.extract_tags(conversation_text)
+            # 添加时间标签
+            tags.extend(self._generate_time_tags())
+            tags = list(set(tags))  # 去重
             
             # 限制标签数量
             if len(tags) > self.summary_max_tags:
@@ -145,6 +189,26 @@ class MemoryEngine:
             
         except Exception as e:
             logger.error(f"转换长期记忆失败: {e}", exc_info=True)
+    
+    def _generate_time_tags(self) -> List[str]:
+        """
+        生成时间标签
+        
+        Returns:
+            时间标签列表 ["2024年", "1月", "15日", "上午"]
+        """
+        now = datetime.now()
+        
+        period = "上午"
+        if now.hour >= 12:
+            period = "下午"
+        
+        year_tag = f"{now.year}年"
+        month_tag = f"{now.month}月"
+        day_tag = f"{now.day}日"
+        period_tag = period
+        
+        return [year_tag, month_tag, day_tag, period_tag]
     
     async def retrieve_relevant_context(
         self,

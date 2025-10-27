@@ -1,6 +1,5 @@
 """
 Memory Graph - 基于 NetworkX 的知识图谱
-从 memory-networkx/organs/memory_graph.py 改造
 """
 import networkx as nx
 import heapq
