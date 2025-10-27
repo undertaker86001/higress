@@ -1,0 +1,161 @@
+# 完整部署配置 - Memory Enhancement Service + ai-history Plugin
+
+---
+# 1. Redis 部署（如果还没有 Redis）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: higress-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: higress-system
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+
+---
+# 2. Memory Enhancement Service 配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: memory-service-config
+  namespace: higress-system
+data:
+  REDIS_HOST: "redis.higress-system.svc.cluster.local"
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+  SERVICE_PORT: "8080"
+  LOG_LEVEL: "INFO"
+  SHORT_TERM_MEMORY_SIZE: "20"
+  RETRIEVE_TOP_N: "5"
+  SUMMARY_MAX_TAGS: "30"
+
+---
+# 3. Memory Enhancement Service 部署
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memory-enhancement-service
+  namespace: higress-system
+  labels:
+    app: memory-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: memory-service
+  template:
+    metadata:
+      labels:
+        app: memory-service
+    spec:
+      containers:
+      - name: memory-service
+        image: your-registry/memory-enhancement-service:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        envFrom:
+        - configMapRef:
+            name: memory-service-config
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: memory-service
+  namespace: higress-system
+  labels:
+    app: memory-service
+spec:
+  type: ClusterIP
+  selector:
+    app: memory-service
+  ports:
+  - port: 8080
+    targetPort: 8080
+    protocol: TCP
+    name: http
+
+---
+# 4. ai-history 插件配置（启用 Memory Service）
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-history
+  namespace: higress-system
+spec:
+  matchRules:
+  - config:
+      redis:
+        serviceName: redis.higress-system.svc.cluster.local
+        servicePort: 6379
+        timeout: 2000
+        database: 0
+      cacheKeyPrefix: "higress-ai-history:"
+      identityHeader: "Authorization"
+      fillHistoryCnt: 3
+      cacheTTL: 0
+      # 启用 Memory Enhancement Service
+      memoryService:
+        enabled: true
+        serviceName: memory-service.higress-system.svc.cluster.local
+        servicePort: 8080
+        timeout: 5000
+        topK: 5
+    ingress:
+    - higress-gateway
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-history:1.0.0

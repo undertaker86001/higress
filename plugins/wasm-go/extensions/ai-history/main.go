@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ const (
 	DefaultCacheKeyPrefix    = "higress-ai-history:"
 	IdentityKey              = "identity"
 	ChatHistories            = "chatHistories"
+	EnhancedContextKey       = "enhancedContext"
 )
 
 func main() {
@@ -88,6 +90,25 @@ type KVExtractor struct {
 	ResponseBody string `required:"false" yaml:"responseBody" json:"responseBody"`
 }
 
+// Memory Enhancement Service 配置
+type MemoryServiceConfig struct {
+	// @Title zh-CN 记忆增强服务名称
+	// @Description zh-CN Memory Enhancement Service 的服务地址，例如 memory-service.higress-system.svc.cluster.local
+	ServiceName string `required:"false" yaml:"serviceName" json:"serviceName"`
+	// @Title zh-CN 记忆增强服务端口
+	// @Description zh-CN 默认值为8080
+	ServicePort int `required:"false" yaml:"servicePort" json:"servicePort"`
+	// @Title zh-CN 记忆增强服务超时时间
+	// @Description zh-CN 单位为毫秒，默认值为5000
+	Timeout int `required:"false" yaml:"timeout" json:"timeout"`
+	// @Title zh-CN 是否启用记忆增强
+	// @Description zh-CN 默认值为false
+	Enabled bool `required:"false" yaml:"enabled" json:"enabled"`
+	// @Title zh-CN 检索记忆数量
+	// @Description zh-CN 从记忆库中检索的相关记忆数量，默认值为5
+	TopK int `required:"false" yaml:"topK" json:"topK"`
+}
+
 type PluginConfig struct {
 	// @Title zh-CN Redis 地址信息
 	// @Description zh-CN 用于存储缓存结果的 Redis 地址
@@ -112,8 +133,11 @@ type PluginConfig struct {
 	FillHistoryCnt int `required:"false" yaml:"fillHistoryCnt" json:"fillHistoryCnt"`
 	// @Title zh-CN 缓存的过期时间
 	// @Description zh-CN 单位是秒，默认值为0，即永不过期
-	CacheTTL    int                 `required:"false" yaml:"cacheTTL" json:"cacheTTL"`
-	redisClient wrapper.RedisClient `yaml:"-" json:"-"`
+	CacheTTL int `required:"false" yaml:"cacheTTL" json:"cacheTTL"`
+	// @Title zh-CN 记忆增强服务配置
+	// @Description zh-CN 配置 Memory Enhancement Service 以启用基于 NetworkX 的记忆增强功能
+	MemoryService MemoryServiceConfig `required:"false" yaml:"memoryService" json:"memoryService"`
+	redisClient   wrapper.RedisClient `yaml:"-" json:"-"`
 }
 
 type ChatHistory struct {
@@ -159,6 +183,26 @@ func parseConfig(json gjson.Result, c *PluginConfig, log wrapper.Log) error {
 		c.FillHistoryCnt = 3
 	}
 	c.CacheTTL = int(json.Get("cacheTTL").Int())
+
+	// 解析 Memory Service 配置
+	c.MemoryService.Enabled = json.Get("memoryService.enabled").Bool()
+	c.MemoryService.ServiceName = json.Get("memoryService.serviceName").String()
+	if c.MemoryService.ServiceName == "" {
+		c.MemoryService.ServiceName = "memory-service.higress-system.svc.cluster.local"
+	}
+	c.MemoryService.ServicePort = int(json.Get("memoryService.servicePort").Int())
+	if c.MemoryService.ServicePort == 0 {
+		c.MemoryService.ServicePort = 8080
+	}
+	c.MemoryService.Timeout = int(json.Get("memoryService.timeout").Int())
+	if c.MemoryService.Timeout == 0 {
+		c.MemoryService.Timeout = 5000
+	}
+	c.MemoryService.TopK = int(json.Get("memoryService.topK").Int())
+	if c.MemoryService.TopK == 0 {
+		c.MemoryService.TopK = 5
+	}
+
 	c.redisClient = wrapper.NewRedisClusterClient(wrapper.FQDNCluster{
 		FQDN: c.RedisInfo.ServiceName,
 		Port: int64(c.RedisInfo.ServicePort),
@@ -204,6 +248,12 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 		return types.ActionContinue
 	}
 	ctx.SetContext(QuestionContextKey, question)
+
+	// 如果启用了 Memory Service，先检索增强上下文
+	if config.MemoryService.Enabled {
+		retrieveEnhancedContext(ctx, config, identityKey, question, log)
+	}
+
 	err := config.redisClient.Get(config.CacheKeyPrefix+identityKey, func(response resp.Value) {
 		if err := response.Error(); err != nil {
 			log.Errorf("redis get  failed, err:%v", err)
@@ -249,6 +299,13 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 			_ = proxywasm.ResumeHttpRequest()
 			return
 		}
+
+		// 如果有增强上下文，注入到 messages 中
+		enhancedContext := ctx.GetStringContext(EnhancedContextKey, "")
+		if enhancedContext != "" {
+			currMessage = injectEnhancedContext(currMessage, enhancedContext)
+		}
+
 		finalChat := fillHistory(chat, currMessage, fillHistoryCnt)
 		var parameter map[string]any
 		err = json.Unmarshal(body, &parameter)
@@ -481,4 +538,123 @@ func saveChatHistory(ctx wrapper.HttpContext, config PluginConfig, questionI any
 	if config.CacheTTL != 0 {
 		_ = config.redisClient.Expire(config.CacheKeyPrefix+identityKey, config.CacheTTL, nil)
 	}
+
+	// 如果启用了 Memory Service，异步调用增强记忆
+	if config.MemoryService.Enabled {
+		enhanceMemoryAsync(config, identityKey, question, value, log)
+	}
+}
+
+// retrieveEnhancedContext 从 Memory Service 检索增强上下文
+func retrieveEnhancedContext(ctx wrapper.HttpContext, config PluginConfig, sessionID string, query string, log wrapper.Log) {
+	reqBody := map[string]interface{}{
+		"session_id": sessionID,
+		"query":      query,
+		"top_k":      config.MemoryService.TopK,
+	}
+
+	reqData, err := json.Marshal(reqBody)
+	if err != nil {
+		log.Errorf("marshal retrieve request failed: %v", err)
+		return
+	}
+
+	_ = wrapper.DispatchHttpCall(
+		config.MemoryService.ServiceName,
+		[][2]string{
+			{":method", "POST"},
+			{":path", "/api/v1/memory/retrieve"},
+			{":authority", config.MemoryService.ServiceName},
+			{"content-type", "application/json"},
+		},
+		reqData,
+		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+			if statusCode != 200 {
+				log.Warnf("retrieve enhanced context failed, status: %d", statusCode)
+				return
+			}
+
+			var resp struct {
+				Status  string   `json:"status"`
+				Context []string `json:"context"`
+			}
+
+			if err := json.Unmarshal(responseBody, &resp); err != nil {
+				log.Errorf("unmarshal retrieve response failed: %v", err)
+				return
+			}
+
+			if len(resp.Context) > 0 {
+				// 将多条记忆合并为一个上下文
+				enhancedCtx := "\n\n相关记忆:\n" + strings.Join(resp.Context, "\n")
+				ctx.SetContext(EnhancedContextKey, enhancedCtx)
+				log.Infof("retrieved %d enhanced memories", len(resp.Context))
+			}
+		},
+		config.MemoryService.Timeout,
+	)
+}
+
+// enhanceMemoryAsync 异步调用 Memory Service 增强记忆
+func enhanceMemoryAsync(config PluginConfig, sessionID string, question string, answer string, log wrapper.Log) {
+	reqBody := map[string]interface{}{
+		"session_id": sessionID,
+		"question":   question,
+		"answer":     answer,
+	}
+
+	reqData, err := json.Marshal(reqBody)
+	if err != nil {
+		log.Errorf("marshal enhance request failed: %v", err)
+		return
+	}
+
+	_ = wrapper.DispatchHttpCall(
+		config.MemoryService.ServiceName,
+		[][2]string{
+			{":method", "POST"},
+			{":path", "/api/v1/memory/enhance"},
+			{":authority", config.MemoryService.ServiceName},
+			{"content-type", "application/json"},
+		},
+		reqData,
+		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+			if statusCode != 200 {
+				log.Warnf("enhance memory failed, status: %d", statusCode)
+				return
+			}
+			log.Infof("memory enhanced successfully for session: %s", sessionID)
+		},
+		config.MemoryService.Timeout,
+	)
+}
+
+// injectEnhancedContext 将增强上下文注入到消息列表中
+func injectEnhancedContext(messages []ChatHistory, enhancedContext string) []ChatHistory {
+	if enhancedContext == "" {
+		return messages
+	}
+
+	// 在 system message 之后，用户消息之前插入增强上下文
+	contextMsg := ChatHistory{
+		Role:    "system",
+		Content: enhancedContext,
+	}
+
+	// 查找第一个非-system 消息的位置
+	insertPos := 0
+	for i, msg := range messages {
+		if msg.Role != "system" {
+			insertPos = i
+			break
+		}
+	}
+
+	// 插入增强上下文
+	result := make([]ChatHistory, 0, len(messages)+1)
+	result = append(result, messages[:insertPos]...)
+	result = append(result, contextMsg)
+	result = append(result, messages[insertPos:]...)
+
+	return result
 }
